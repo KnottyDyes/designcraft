@@ -37,11 +37,11 @@ pub fn specs() -> Vec<CommandSpec> {
             "Color Settings",
             [],
             None,
-            "{rgb?: working RGB profile, cmyk?: working CMYK profile, intent?: perceptual|relative|saturation|absolute, bpc?: bool} → {rgb, cmyk, intent, bpc, profiles}",
+            "{rgb?: working RGB profile ID, cmyk?: working CMYK profile ID, intent?: perceptual|relative|saturation|absolute, bpc?: bool} → {rgb, cmyk, intent, bpc, profiles}; IDs are returned; legacy names are accepted after ID lookup",
             always,
             |_s, p| set(p)
         ),
-        cmd!(noundo "color.loadProfile", "Load Profile…", [], None, "{path} — an ICC profile (.icc/.icm) to use as a working space or proof target", always, |_s, p| {
+        cmd!(noundo "color.loadProfile", "Load Profile…", [], None, "{path} → {id, name, kind, builtin}; load an ICC profile (.icc/.icm) for working spaces or proof targets; colliding stem IDs receive numeric suffixes without replacing existing profiles", always, |_s, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("color.loadProfile", "`path` required"))?;
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -76,6 +76,19 @@ mod tests {
     use serde_json::json;
 
     use crate::Session;
+
+    #[test]
+    fn settings_command_accepts_ids_and_canonicalizes_legacy_names() {
+        let mut session = Session::new();
+        let by_id = session.execute("color.settings", &json!({"rgb": "srgb", "cmyk": "generic-cmyk"})).unwrap();
+        assert_eq!(by_id["rgb"], "srgb");
+        assert_eq!(by_id["cmyk"], "generic-cmyk");
+        let by_name =
+            session.execute("color.settings", &json!({"rgb": designcraft_color::cms::SRGB, "cmyk": designcraft_color::cms::GENERIC_CMYK})).unwrap();
+        assert_eq!(by_name["rgb"], by_id["rgb"]);
+        assert_eq!(by_name["cmyk"], by_id["cmyk"]);
+        assert!(session.execute("color.settings", &json!({"rgb": "generic-cmyk"})).is_err());
+    }
 
     #[test]
     fn color_settings_report_convert_and_validate() {

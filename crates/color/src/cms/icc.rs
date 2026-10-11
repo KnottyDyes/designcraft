@@ -6,6 +6,12 @@ use moxcms::{ColorProfile, DataColorSpace, Layout, ProfileText, RenderingIntent,
 
 use super::{CmsError, Intent, ProfileKind};
 
+/// The parsed ICC header's profile-class tag.
+pub use moxcms::ProfileClass as ProfileClassTag;
+
+/// Maximum imported ICC payload size; the parser retains its own lower limit.
+pub const MAX_ICC_BYTES: usize = 64 * 1024 * 1024;
+
 fn moxcms_intent(i: Intent) -> RenderingIntent {
     match i {
         Intent::Perceptual => RenderingIntent::Perceptual,
@@ -27,6 +33,10 @@ type Xf = Option<Arc<TransformF32Executor>>;
 pub struct IccProfile {
     pub name: String,
     pub kind: ProfileKind,
+    /// Declared ICC bytes, excluding file padding. Programmatic profiles have no raw payload.
+    pub raw: Arc<[u8]>,
+    pub class: ProfileClassTag,
+    pub channels: usize,
     profile: ColorProfile,
     srgb: ColorProfile,
     to_srgb: [OnceLock<Xf>; 4],
@@ -35,7 +45,13 @@ pub struct IccProfile {
 
 impl std::fmt::Debug for IccProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IccProfile").field("name", &self.name).field("kind", &self.kind).finish()
+        f.debug_struct("IccProfile")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("class", &self.class)
+            .field("channels", &self.channels)
+            .field("raw_len", &self.raw.len())
+            .finish()
     }
 }
 
@@ -57,13 +73,48 @@ impl IccProfile {
             DataColorSpace::Gray => ProfileKind::Gray,
             other => return Err(CmsError::Unsupported(format!("profile colour space {other:?} is not RGB, CMYK or Gray"))),
         };
+        let channels = match kind {
+            ProfileKind::Cmyk => 4,
+            ProfileKind::Gray => 1,
+            ProfileKind::Rgb => 3,
+        };
         let name = name.or_else(|| text(&profile.description)).unwrap_or_else(|| format!("Untitled {kind:?} profile"));
-        Ok(Self { name, kind, profile, srgb: ColorProfile::new_srgb(), to_srgb: Default::default(), from_srgb: Default::default() })
+        Ok(Self {
+            name,
+            kind,
+            raw: Arc::from([]),
+            class: profile.profile_class,
+            channels,
+            profile,
+            srgb: ColorProfile::new_srgb(),
+            to_srgb: Default::default(),
+            from_srgb: Default::default(),
+        })
     }
 
     pub fn from_bytes(name: Option<String>, bytes: &[u8]) -> Result<Self, CmsError> {
+        if bytes.len() > MAX_ICC_BYTES {
+            return Err(CmsError::BadProfile("ICC payload exceeds size limit".into()));
+        }
+        if bytes.len() < 128 {
+            return Err(CmsError::BadProfile("ICC header is shorter than 128 bytes".into()));
+        }
+        let declared = bytes
+            .get(..4)
+            .and_then(|value| <[u8; 4]>::try_from(value).ok())
+            .map(u32::from_be_bytes)
+            .ok_or_else(|| CmsError::BadProfile("missing declared ICC length".into()))?;
+        let declared = usize::try_from(declared).map_err(|e| CmsError::BadProfile(e.to_string()))?;
+        if declared < 128 {
+            return Err(CmsError::BadProfile(format!("declared ICC length {declared} is shorter than the header")));
+        }
+        let bytes = bytes
+            .get(..declared)
+            .ok_or_else(|| CmsError::BadProfile(format!("declared ICC length {declared} exceeds actual length {}", bytes.len())))?;
         let p = ColorProfile::new_from_slice(bytes).map_err(|e| CmsError::BadProfile(format!("{e:?}")))?;
-        Self::from_profile(name, p)
+        let mut profile = Self::from_profile(name, p)?;
+        profile.raw = Arc::from(bytes);
+        Ok(profile)
     }
 
     fn layout(&self) -> Layout {
@@ -71,14 +122,6 @@ impl IccProfile {
             ProfileKind::Cmyk => Layout::Rgba, // 4 channels
             ProfileKind::Gray => Layout::Gray,
             ProfileKind::Rgb => Layout::Rgb,
-        }
-    }
-
-    fn channels(&self) -> usize {
-        match self.kind {
-            ProfileKind::Cmyk => 4,
-            ProfileKind::Gray => 1,
-            ProfileKind::Rgb => 3,
         }
     }
 
@@ -102,7 +145,7 @@ impl IccProfile {
     pub fn to_srgb(&self, v: &[f32], intent: Intent) -> Option<[f32; 3]> {
         let xf = self.to_xf(intent)?;
         let mut src = v.to_vec();
-        src.resize(self.channels(), 0.0);
+        src.resize(self.channels, 0.0);
         let mut dst = [0.0f32; 3];
         xf.transform(&src, &mut dst).ok()?;
         Some(dst.map(|x| x.clamp(0.0, 1.0)))
@@ -111,7 +154,7 @@ impl IccProfile {
     /// sRGB → device values.
     pub fn from_srgb(&self, rgb: [f32; 3], intent: Intent) -> Option<Vec<f32>> {
         let xf = self.inverse_xf(intent)?;
-        let mut dst = vec![0.0f32; self.channels()];
+        let mut dst = vec![0.0f32; self.channels];
         xf.transform(&rgb, &mut dst).ok()?;
         Some(dst.into_iter().map(|x| x.clamp(0.0, 1.0)).collect())
     }

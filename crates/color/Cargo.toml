@@ -17,3 +17,4 @@ moxcms = "0.8"
 [dev-dependencies]
 proptest = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }

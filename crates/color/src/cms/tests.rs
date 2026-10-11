@@ -181,7 +181,7 @@ fn colour_blindness_proofs() {
 
 #[test]
 fn bad_icc_rejected() {
-    assert!(matches!(register_icc(b"not a profile", None), Err(CmsError::BadProfile(_))));
+    assert!(matches!(register_icc(b"not a profile", "invalid", None), Err(CmsError::BadProfile(_))));
 }
 
 #[cfg(target_os = "macos")]

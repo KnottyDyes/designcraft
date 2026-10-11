@@ -1442,12 +1442,19 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                     for (key, label, kind) in [("rgb", "RGB:", "rgb"), ("cmyk", "CMYK:", "cmyk")] {
                         crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, label));
                         let cur = d.s(key);
-                        egui::ComboBox::from_id_salt(("ws", key)).selected_text(&cur).width(260.0).show_ui(ui, |ui| {
+                        let selected = profiles.iter().find(|p| p["id"].as_str() == Some(cur.as_str()))
+                            .or_else(|| profiles.iter().find(|p| p["name"].as_str() == Some(cur.as_str())));
+                        let shown = selected.and_then(|p| p["name"].as_str()).unwrap_or(&cur);
+                        let selected_id = selected.and_then(|p| p["id"].as_str());
+                        egui::ComboBox::from_id_salt(("ws", key)).selected_text(shown).width(260.0).show_ui(ui, |ui| {
                             for pr in profiles.iter().filter(|p| p["kind"] == kind) {
+                                let id = pr["id"].as_str().unwrap_or("");
                                 let name = pr["name"].as_str().unwrap_or("");
-                                if ui.selectable_label(name == cur, name).clicked() {
-                                    d.fields.insert(key.into(), json!(name));
-                                }
+                                ui.push_id(id, |ui| {
+                                    if ui.selectable_label(selected_id == Some(id), name).clicked() {
+                                        d.fields.insert(key.into(), json!(id));
+                                    }
+                                });
                             }
                         });
                         ui.end_row();

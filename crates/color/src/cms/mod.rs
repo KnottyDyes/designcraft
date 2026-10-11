@@ -11,8 +11,12 @@
 
 pub mod generic;
 pub mod icc;
+#[cfg(not(target_arch = "wasm32"))]
+mod icc_file;
 pub mod icc_out;
 pub mod lab;
+#[cfg(not(target_arch = "wasm32"))]
+pub use icc_file::load_icc_file;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -33,6 +37,15 @@ pub const PROPHOTO_RGB: &str = "ProPhoto RGB";
 pub const GENERIC_CMYK: &str = "DesignCraft Generic CMYK (SWOP-like)";
 /// Profile-free CMYK (`rgb = (1−c)(1−k)` …): uncalibrated, kept for legacy numbers.
 pub const DEVICE_CMYK: &str = "Device CMYK (uncalibrated)";
+
+const BUILTIN_PROFILES: [(&str, &str, ProfileKind); 6] = [
+    ("srgb", SRGB, ProfileKind::Rgb),
+    ("adobe-rgb", ADOBE_RGB, ProfileKind::Rgb),
+    ("display-p3", DISPLAY_P3, ProfileKind::Rgb),
+    ("prophoto-rgb", PROPHOTO_RGB, ProfileKind::Rgb),
+    ("generic-cmyk", GENERIC_CMYK, ProfileKind::Cmyk),
+    ("device-cmyk", DEVICE_CMYK, ProfileKind::Cmyk),
+];
 
 /// ΔE2000 above which a colour counts as out of the CMYK gamut (the gamut warning).
 pub const GAMUT_THRESHOLD: f32 = 2.0;
@@ -89,6 +102,8 @@ pub enum ProfileKind {
 /// A profile the user can pick.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProfileInfo {
+    /// Stable identity, independent of the profile's display description.
+    pub id: String,
     pub name: String,
     pub kind: ProfileKind,
     pub builtin: bool,
@@ -110,9 +125,9 @@ pub enum CmsError {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ColorSettings {
-    /// RGB working space.
+    /// RGB working-space ID (legacy saved display names are also accepted).
     pub rgb: String,
-    /// CMYK working space.
+    /// CMYK working-space ID (legacy saved display names are also accepted).
     pub cmyk: String,
     /// Conversion intent (Convert to CMYK, document colour mode).
     pub intent: Intent,
@@ -122,7 +137,7 @@ pub struct ColorSettings {
 
 impl Default for ColorSettings {
     fn default() -> Self {
-        Self { rgb: SRGB.into(), cmyk: GENERIC_CMYK.into(), intent: Intent::RelativeColorimetric, bpc: true }
+        Self { rgb: "srgb".into(), cmyk: "generic-cmyk".into(), intent: Intent::RelativeColorimetric, bpc: true }
     }
 }
 
@@ -152,7 +167,7 @@ fn generic() -> Arc<GenericCmyk> {
     G.get_or_init(|| Arc::new(GenericCmyk::new(generic::swop_like()))).clone()
 }
 
-static USER: RwLock<Vec<Arc<IccProfile>>> = RwLock::new(Vec::new());
+static USER: RwLock<Vec<(ProfileInfo, Arc<IccProfile>)>> = RwLock::new(Vec::new());
 
 fn builtin_rgb_cache(name: &str) -> Option<Arc<IccProfile>> {
     static CACHE: Mutex<Vec<Arc<IccProfile>>> = Mutex::new(Vec::new());
@@ -165,15 +180,29 @@ fn builtin_rgb_cache(name: &str) -> Option<Arc<IccProfile>> {
     Some(p)
 }
 
-fn user_profile(name: &str) -> Option<Arc<IccProfile>> {
-    USER.read().unwrap_or_else(|e| e.into_inner()).iter().find(|p| p.name == name).cloned()
+fn resolve_profile(key: &str) -> Result<ProfileInfo, CmsError> {
+    let users = USER.read().unwrap_or_else(|e| e.into_inner());
+    let builtin = |(id, name, kind): &(&str, &str, ProfileKind)| ProfileInfo { id: (*id).into(), name: (*name).into(), kind: *kind, builtin: true };
+    BUILTIN_PROFILES
+        .iter()
+        .find(|(id, _, _)| *id == key)
+        .map(builtin)
+        .or_else(|| users.iter().find(|(info, _)| info.id == key).map(|(info, _)| info.clone()))
+        .or_else(|| BUILTIN_PROFILES.iter().find(|(_, name, _)| *name == key).map(builtin))
+        .or_else(|| users.iter().find(|(info, _)| info.name == key).map(|(info, _)| info.clone()))
+        .ok_or_else(|| CmsError::UnknownProfile(key.into()))
+}
+
+fn user_profile(id: &str) -> Option<Arc<IccProfile>> {
+    USER.read().unwrap_or_else(|e| e.into_inner()).iter().find(|(info, _)| info.id == id).map(|(_, profile)| profile.clone())
 }
 
 fn cmyk_space(name: &str) -> Result<CmykSpace, CmsError> {
-    match name {
-        GENERIC_CMYK => Ok(CmykSpace::Generic(generic())),
-        DEVICE_CMYK => Ok(CmykSpace::Device),
-        _ => match user_profile(name) {
+    let info = resolve_profile(name)?;
+    match info.id.as_str() {
+        "generic-cmyk" => Ok(CmykSpace::Generic(generic())),
+        "device-cmyk" => Ok(CmykSpace::Device),
+        _ => match user_profile(&info.id) {
             Some(p) if p.kind == ProfileKind::Cmyk => Ok(CmykSpace::Icc(p)),
             Some(_) => Err(CmsError::Unsupported(format!("{name} is not a CMYK profile"))),
             None => Err(CmsError::UnknownProfile(name.into())),
@@ -182,13 +211,14 @@ fn cmyk_space(name: &str) -> Result<CmykSpace, CmsError> {
 }
 
 fn rgb_space(name: &str) -> Result<RgbSpace, CmsError> {
-    if name == SRGB {
+    let info = resolve_profile(name)?;
+    if info.id == "srgb" {
         return Ok(RgbSpace::Srgb);
     }
-    if let Some(p) = builtin_rgb_cache(name) {
+    if let Some(p) = builtin_rgb_cache(&info.name).filter(|_| info.builtin) {
         return Ok(RgbSpace::Icc(p));
     }
-    match user_profile(name) {
+    match user_profile(&info.id) {
         Some(p) if p.kind == ProfileKind::Rgb => Ok(RgbSpace::Icc(p)),
         Some(_) => Err(CmsError::Unsupported(format!("{name} is not an RGB profile"))),
         None => Err(CmsError::UnknownProfile(name.into())),
@@ -197,44 +227,44 @@ fn rgb_space(name: &str) -> Result<RgbSpace, CmsError> {
 
 /// Every profile available (built-in first, then user-loaded).
 pub fn profiles() -> Vec<ProfileInfo> {
-    let mut v: Vec<ProfileInfo> = [SRGB, ADOBE_RGB, DISPLAY_P3, PROPHOTO_RGB]
-        .iter()
-        .map(|n| ProfileInfo { name: (*n).into(), kind: ProfileKind::Rgb, builtin: true })
-        .chain([GENERIC_CMYK, DEVICE_CMYK].iter().map(|n| ProfileInfo { name: (*n).into(), kind: ProfileKind::Cmyk, builtin: true }))
-        .collect();
-    for p in USER.read().unwrap_or_else(|e| e.into_inner()).iter() {
-        v.push(ProfileInfo { name: p.name.clone(), kind: p.kind, builtin: false });
+    let mut v: Vec<ProfileInfo> =
+        BUILTIN_PROFILES.iter().map(|(id, name, kind)| ProfileInfo { id: (*id).into(), name: (*name).into(), kind: *kind, builtin: true }).collect();
+    for (info, _) in USER.read().unwrap_or_else(|e| e.into_inner()).iter() {
+        v.push(info.clone());
     }
     v
 }
 
 /// Register an ICC profile from bytes (named by its description unless `name` is given).
-/// Re-registering a name replaces the old profile.
-pub fn register_icc(bytes: &[u8], name: Option<String>) -> Result<ProfileInfo, CmsError> {
+/// Colliding IDs receive numeric suffixes; existing profiles and first legacy name matches remain.
+/// Built-in IDs and display names cannot be replaced. Lookups prefer IDs over legacy names.
+pub fn register_icc(bytes: &[u8], id: &str, name: Option<String>) -> Result<ProfileInfo, CmsError> {
+    if id.trim().is_empty() {
+        return Err(CmsError::Unsupported("profile ID must not be empty or whitespace-only".into()));
+    }
     let p = IccProfile::from_bytes(name, bytes)?;
     if p.kind == ProfileKind::Gray {
         return Err(CmsError::Unsupported("grayscale profiles can't be working spaces yet".into()));
     }
-    if [SRGB, ADOBE_RGB, DISPLAY_P3, PROPHOTO_RGB, GENERIC_CMYK, DEVICE_CMYK].contains(&p.name.as_str()) {
+    if BUILTIN_PROFILES.iter().any(|(_, name, _)| *name == p.name) {
         return Err(CmsError::Unsupported(format!("{} clashes with a built-in profile name", p.name)));
     }
     if !p.usable() {
         return Err(CmsError::Unsupported(format!("{}: no usable transform to/from sRGB", p.name)));
     }
-    let info = ProfileInfo { name: p.name.clone(), kind: p.kind, builtin: false };
+    let mut info = ProfileInfo { id: id.into(), name: p.name.clone(), kind: p.kind, builtin: false };
     let mut u = USER.write().unwrap_or_else(|e| e.into_inner());
-    u.retain(|x| x.name != info.name);
-    u.push(Arc::new(p));
+    let mut suffix = 1usize;
+    while u.iter().any(|(existing, _)| existing.id == info.id || existing.name == info.id)
+        || BUILTIN_PROFILES.iter().any(|(id, name, _)| *id == info.id || *name == info.id)
+    {
+        suffix = suffix.checked_add(1).ok_or_else(|| CmsError::Unsupported("profile ID suffix overflow".into()))?;
+        info.id = format!("{id}-{suffix}");
+    }
+    u.push((info.clone(), Arc::new(p)));
     drop(u);
     clear_proof_cache();
     Ok(info)
-}
-
-/// Load a `.icc`/`.icm` file from disk (native only).
-#[cfg(not(target_arch = "wasm32"))]
-pub fn load_icc_file(path: &std::path::Path) -> Result<ProfileInfo, CmsError> {
-    let bytes = std::fs::read(path).map_err(|e| CmsError::Io(format!("{}: {e}", path.display())))?;
-    register_icc(&bytes, None)
 }
 
 /// A colour-management context: resolved working spaces plus conversion settings.
@@ -259,7 +289,10 @@ impl Default for Cms {
 
 impl Cms {
     pub fn new(settings: &ColorSettings) -> Result<Self, CmsError> {
-        Ok(Self { settings: settings.clone(), rgb: rgb_space(&settings.rgb)?, cmyk: cmyk_space(&settings.cmyk)? })
+        let settings = ColorSettings { rgb: resolve_profile(&settings.rgb)?.id, cmyk: resolve_profile(&settings.cmyk)?.id, ..settings.clone() };
+        let rgb = rgb_space(&settings.rgb)?;
+        let cmyk = cmyk_space(&settings.cmyk)?;
+        Ok(Self { settings, rgb, cmyk })
     }
     pub fn settings(&self) -> &ColorSettings {
         &self.settings
