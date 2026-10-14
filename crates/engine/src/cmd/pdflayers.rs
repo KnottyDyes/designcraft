@@ -112,8 +112,12 @@ pub(crate) mod tests {
         assert!(right[0] > 200 && right[1] > 200 && right[2] > 200, "the red layer is hidden: {right:?}");
         assert!(px(&s, 125)[2] > 200, "blue still shows");
         assert_eq!(s.execute("object.pdfLayers", &json!({"id": id})).unwrap()[1]["visible"], false);
-        // PDF export carries the choice (the graphic goes out as an image).
         let r = s.execute("file.exportPdf", &json!({})).unwrap();
-        assert!(r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("layer")), "{r}");
+        assert!(r["warnings"].as_array().unwrap().is_empty(), "{r}");
+        let bytes = super::super::file::base64_decode(r["base64"].as_str().unwrap());
+        let image = designcraft_render::render_pdf_page(&bytes, 0, 792).unwrap();
+        let width = usize::from(image.width());
+        assert!(image.data()[150 * width + 125].a > 200);
+        assert_eq!(image.data()[150 * width + 175].a, 0);
     }
 }

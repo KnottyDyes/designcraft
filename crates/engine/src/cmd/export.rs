@@ -722,9 +722,8 @@ fn export_pdf(s: &mut Session, p: &Value) -> Result<Value> {
         ),
     };
     let flattened = ppi.map(|ppi| flatten(&st.doc, &s.cache, ppi));
-    // Placed PDFs with hidden layers go out as images showing just their visible layers.
     let base: &designcraft_doc::Document = flattened.as_ref().map_or(&st.doc, |f| &f.0);
-    let (layered, layer_count) = rasterize_layered(base);
+    let (layered, layer_count) = if opts.standard == Standard::PdfA2b { rasterize_layered(base) } else { (None, 0) };
     let base2: &designcraft_doc::Document = layered.as_ref().unwrap_or(base);
     let (fx_doc, fx_count) = rasterize_effects(base2, &s.cache);
     let doc: &designcraft_doc::Document = fx_doc.as_ref().unwrap_or(base2);
